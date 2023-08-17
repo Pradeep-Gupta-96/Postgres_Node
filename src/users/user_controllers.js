@@ -12,7 +12,7 @@ import {
     update_last_login_active_ip_query,
     userstatusQuery
 } from "./user_queries.js";
-import { sendPasswordResetEmail } from "./emailService.js";
+import { sendPasswordResetEmail, sendVerificationOTP } from "./emailService.js";
 
 
 // Define a function to create the users table if it doesn't exist
@@ -29,6 +29,11 @@ export const createUserTable = async (req, res) => {
         res.status(500).json({ message: error.message }); // Handle errors and respond with an error message
     }
 };
+
+// Generate a reset token
+const generateOTP = () => {
+    return Math.floor(100000 + Math.random() * 900000)
+}
 
 
 export const signup = async (req, res) => {
@@ -57,15 +62,70 @@ export const signup = async (req, res) => {
                 );
 
                 const user = newUserResult.rows[0];
+
+                // Generate and send OTP for verification
+                const OTP = generateOTP();
+                const resetTokenExpiration = new Date(Date.now() + 3600000); // Expiration in one hour
+
+                // Store the reset token and expiration in the database
+                await pool.query(
+                    "UPDATE users SET reset_token = $2, reset_token_expiration = $3 WHERE email = $1",
+                    [email, OTP, resetTokenExpiration]
+                );
+
+                // Send OTP for verification
+                await sendVerificationOTP(email, OTP);
+
+                // Set 'is_verified' to false initially
+                await pool.query('UPDATE users SET is_verified = false WHERE id = $1', [user.id]);
+
+                // Schedule a deletion timer if not verified within 10 minutes
+                setTimeout(async () => {
+                    const verificationStatus = await pool.query('SELECT is_verified FROM users WHERE id = $1', [user.id]);
+                    if (!verificationStatus.rows[0].is_verified) {
+                        // Delete the user account
+                        await pool.query('DELETE FROM users WHERE id = $1', [user.id]);
+                        console.log(`Deleted user with id ${user.id} due to non-verification.`);
+                    }
+                }, 10 * 60 * 1000); // 10 minutes in milliseconds
+
                 const token = jwt.sign({ user: user.email, id: user.id }, process.env.SECRET_KEY);
 
-                return res.status(200).json({ user, token });
+                return res.status(200).json({
+                    message: "User registered successfully. Please verify your email within 10 minutes.",
+                    user,
+                    token
+                });
             }
         }
     } catch (error) {
         res.status(500).json({ message: error.message });
     }
 };
+
+
+export const verifyOTP = async (req, res) => {
+    try {
+        const { email, enteredOTP } = req.body;
+
+        // Retrieve the user's generated OTP from your database
+        const userResult = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
+        const user = userResult.rows[0];
+
+        // Compare the entered OTP with the generated OTP
+        if (enteredOTP === user.reset_token) { 
+            // Update 'is_verified' field in the database
+            await pool.query('UPDATE users SET is_verified = true WHERE id = $1', [user.id]);
+
+            return res.status(200).json({ message: "Email verified successfully" });
+        } else {
+            return res.status(400).json({ message: "Invalid OTP" });
+        }
+    } catch (error) {
+        res.status(500).json({ message: error.message });
+    }
+};
+
 
 export const getAllUsers = async (req, res) => {
     try {
